@@ -1,0 +1,997 @@
+Changelog
+==============
+
+7.0.1 (unreleased)
+------------------
+
+
+7.0.0 (2026-11-08)
+------------------
+
+This is a major release because several bug fixes change what existing, valid
+expressions mean. Read **Upgrading to 7.0** before you upgrade. Every change is
+listed in full under *Bugfixes*.
+
+Upgrading to 7.0
+~~~~~~~~~~~~~~~~
+
+Changes 1 and 2 are silent: nothing fails, schedules just fire at different times.
+Changes 3 and 4 raise an exception.
+
+**1. A step that starts at the field maximum now means one value, not the whole field (#246).**
+Each field's maximum is ``59`` for seconds and minutes, ``23`` for hours, ``31`` for
+day-of-month, ``12``/``DEC`` for month, ``6``/``SAT`` (or ``7``) for day-of-week and
+``2099`` for years.
+
+- *Who is affected:* any expression in which a field starts with its maximum
+  followed by ``/``, for example ``59/15``, ``23/6``, ``31/5``, ``DEC/3``,
+  ``SAT/2``, ``6/1`` or ``2099/1``.
+- *What to do:* find these expressions in your code, configuration and stored data.
+  A field value such as ``59/...`` or ``6/...`` is the pattern to look for. Decide
+  what each one was meant to do:
+
+  - It meant "every": replace it with ``*`` or ``*/{step}``. ``* * * * 6/1``
+    becomes ``* * * * *``, and ``59/15 * * * *`` becomes ``*/15 * * * *``.
+  - It meant "only the maximum": no change is needed, because 7.0 now does that.
+  - It is in a year field (``2099/1``) or on a day that can be missing
+    (``31/5`` with month ``2``): the expression may now have no future match and
+    raise ``CroniterBadDateError`` (see 4 below). Rewrite it with ``*``.
+
+**2. ``expand_from_start_time=True`` keeps the bounds of ranges (#255, #256, #246).**
+If you never pass ``expand_from_start_time``, skip this item: default-mode schedules
+are unchanged.
+
+- *Who is affected:* expressions with an explicit range, an equal range such as
+  ``1-1/3``, a wrapping range such as ``6-0``, or a stepped start such as ``5/15``.
+  In 6.x such a range could fire outside its own bounds, so ``* 8-17 * * *``
+  fired at hours 0-17. The phase was also read in UTC instead of the start time's
+  own time zone.
+- *What to do:* for each schedule that uses the flag, compare the old and new
+  ``expanded`` values. Install 7.0 in a separate environment, or run the snippet
+  below under both versions with your own expressions, start times and time zones:
+
+  .. code-block:: python
+
+      from datetime import datetime, timezone
+      from croniter import croniter
+
+      start = datetime(2026, 1, 1, 7, 7, tzinfo=timezone.utc)  # use your real start
+      for expr in ["* 8-17 * * *", "5/15 * * * *"]:            # your expressions
+          print(expr, croniter(expr, start, expand_from_start_time=True).expanded)
+
+  Where the output differs, 7.0 matches the expression as written. If you relied
+  on the old output, write that schedule out explicitly, for example as a list
+  of values, instead of relying on the flag. A schedule can now fire less often
+  (``45/15`` fires once an hour, not four times), or more often in the case of
+  equal and wrapping ranges (``1-1/15`` in the minute field fires four times an
+  hour). See the warning under #255 for the full breakdown.
+
+**3. Some expressions that used to be accepted now raise ``CroniterBadCronError``.**
+
+- *Who is affected:* expressions containing any of the following:
+
+  - non-ASCII digits or non-ASCII whitespace (#284, #288);
+  - a ``H(a-b)`` or ``R(a-b)`` range outside its field (#289);
+  - day-of-month ``0`` in the 6-field seconds form (#280);
+  - an out-of-range ``#`` such as ``1#0`` or ``1#7`` (#278).
+
+- *What to do:* where expressions come from users or storage, check them with
+  ``croniter.is_valid()`` before you upgrade, and fix the ones that fail. Each
+  rejected form either matched something the text did not say or depended on the
+  hash id, so there is no behaviour to keep.
+
+**4. Some schedules now raise ``CroniterBadDateError`` or ``TypeError``/``ValueError``.**
+
+- An expression changed by item 1 can have no remaining match. ``get_next`` then
+  raises ``CroniterBadDateError``, so rewrite the expression as described in item 1.
+- ``max_years_between_matches`` must now be an ``int`` >= 1 or ``None`` (#272).
+  Replace ``True`` with ``1``, ``0`` or a negative number with ``1``, and pass
+  ``int(...)`` instead of a float or string.
+
+**Other changes in behaviour.** These are corrections of wrong results, and no
+action is expected:
+
+- ``get_next``, ``get_prev``, ``match`` and ``croniter_range`` no longer report
+  times invented inside a DST gap (#266).
+- pytz zones with negative DST offsets, such as ``Europe/Dublin``, no longer crash
+  (#267).
+- Day-of-week ``7`` is accepted in the 6- and 7-field forms (#263).
+- A few hashed divisions wider than their range (``H/60``, ``H/100``) produce
+  different values (#253).
+
+If you cannot audit your expressions yet, pin ``croniter<7``.
+
+Bugfixes
+~~~~~~~~
+- Reject hashed and random ranges whose bounds lie outside their field, such as
+  ``H(0-99)`` in the minute field. The bounds were only checked through the value drawn
+  from them, so such an expression was valid for some hash ids and not others, and
+  ``is_valid("R(0-99) * * * *")`` returned ``True`` or ``False`` depending on the draw.
+  They now raise ``CroniterBadCronError`` for every hash id and draw. [#289, @Raghuvardhan-Reddy78]
+- ``max_years_between_matches`` must be an ``int`` greater than or equal to 1, or ``None``.
+  ``bool`` is rejected (``True`` used to become 1 via ``int(True)``). ``0``, negatives,
+  floats, and strings are rejected too: ``0`` and negatives used to be raised to 1,
+  floats were truncated, and numeric strings were parsed by ``int()``. A bad type
+  raises ``TypeError``. An int below 1 raises ``ValueError``. [#272]
+- Reject non-ASCII whitespace between cron fields. ``str.split()`` splits on any
+  Unicode whitespace, so ``0 0 * * *`` written with a no-break space or an
+  ideographic space between the fields passed ``is_valid`` and ran as ``0 0 * * *``,
+  while cron only separates fields on spaces and tabs. These now raise
+  ``CroniterBadCronError``. The ASCII separators ``\x1c``-``\x1f`` are no longer treated
+  as field separators either. Follow-up to #284. [#288, @Raghuvardhan-Reddy78]
+- Fix day-of-month ``0`` being silently rewritten to ``1`` and accepted in the 6-field seconds form (e.g. ``0 0 0 * * *``): it is now rejected with ``CroniterBadCronError``, matching the 5-field form fixed for #9 and the 7-field years form. [#280]
+- Fix ``get_next``/``get_prev`` raising ``AssertionError`` for pytz timezones whose
+  tzdb encoding uses a negative DST offset (for example ``Europe/Dublin``). At an
+  ambiguous local time the resolution assumed the ``is_dst=True`` interpretation is
+  always the later UTC instant; such zones invert that ordering, so the internal
+  assertion tripped and evaluation crashed instead of returning a fire time. Both
+  interpretations are now ordered by their absolute instants and the first one
+  satisfying the successor requirement in the requested direction is returned.
+  [#267, @abhijeet117]
+- Fix day-of-week ``7`` (Sunday) being rejected in the 6-field (seconds) and 7-field
+  (year) forms. ``7`` is now accepted as an alias for ``0`` in every form, as it already
+  was in the classic 5-field form. [#263, @nikolauspschuetz]
+- Reject non-ASCII digits in cron expressions. The parsing regexes used Unicode ``\d``
+  and ``\w``, and ``int()`` also accepts any Unicode decimal digit, so ``٥ * * * *``
+  (Arabic-Indic five) or ``０ ０ * * *`` (fullwidth zeros) passed ``is_valid`` and ran as
+  ``5 * * * *`` and ``0 0 * * *``. These now raise ``CroniterBadCronError``.
+  [#284, @Raghuvardhan-Reddy78]
+- Fix ``get_next``, ``get_prev``, ``match`` and ``croniter_range`` reporting a DST gap shift
+  as a fire time. When a cron slot fell into a spring-forward gap and resolving the
+  alternative across the offset change walked forward to the next existing wall clock, that
+  manufactured wall clock was returned although its fields did not match the expression: for
+  ``0 * * * *`` in ``Australia/Lord_Howe``, whose transition is only 30 minutes, ``get_prev``
+  from 03:00 landed on 02:30, ``get_next`` from 01:03 returned 02:30, ``match(02:30)`` was
+  true, and ``croniter_range`` listed 02:30. A shifted alternative is now discarded like the
+  regular candidate already was when hours are wildcarded, so the four APIs agree again.
+  [#266, @abhijeet117]
+- Fix ``get_next``/``get_prev`` raising ``CroniterBadDateError`` when day-of-month and day-of-week are both restricted and the day-of-month can never occur in the selected month (e.g. ``0 0 31 2 0``). Under the Vixie OR semantics the unsatisfiable side now contributes no dates instead of aborting the whole expression, and ``match()`` and ``croniter_range()``, which swallow the error, no longer return silently wrong results for these expressions. [b245ab6, #243, @semx, @MildlyMeticulous]
+- Fix hashed divisions (``H/{divisor}``, ``H({begin}-{end})/{divisor}``) when the divisor
+  is as wide as, or wider than, the range it is drawn from. Three symptoms, one cause:
+  the offset was drawn from the first period without regard for where the range ends,
+  and the result was emitted as ``{offset}-{end}/{divisor}`` even when the step could
+  not reach a second value. ``H/60`` lost minute 59 and fired at minute 0 twice as
+  often as any other minute (59 distinct schedules over 20,000 hash ids, not 60);
+  ``H(50-59)/10`` fired six times an hour instead of once for the ids hashing to 59;
+  ``H(50-52)/10`` fired outside its own range for 7 hash buckets in 10, and ``H/100``
+  raised ``CroniterBadCronError`` for roughly a third of hash ids. The offset is now
+  clamped to the declared range and emitted as a single value when the step cannot
+  reach a second one. Divisors that fit their range keep their existing hashes, so no
+  schedule that was already correct moves. [#253, @potiuk]
+- Fix ``expand_from_start_time`` taking the phase of a cycle from the UTC form of a
+  timezone-aware ``start_time`` rather than from the wall clock the caller wrote.
+  ``_get_low_from_current_date_number`` read the start time back with ``tz=UTC``, so
+  ``0 */5 * * *`` from ``2025-01-01 05:00+13:00`` phased on UTC hour 16 and expanded to
+  hours ``1,6,11,16,21`` instead of ``0,5,10,15,20``. The hour, day-of-month, month and
+  day-of-week fields were all affected, and at a date boundary the day and month could
+  be a whole day or month out. The start time's own ``tzinfo`` is now carried into the
+  expansion. A naive ``start_time`` is converted to a timestamp as if it were UTC, so
+  UTC round-trips it to the same wall clock and naive callers see no change at all —
+  verified over 45,312 expansions with naive start times, none of which differ.
+  [#256, @potiuk]
+- Fix ``expand_from_start_time`` raising ``ValueError: Can't get current date number for
+  index larger than 4`` for any range or step in the optional **seconds** or **years**
+  field. ``croniter("* * * * * */15", start, expand_from_start_time=True)`` aborted, and
+  because the exception came from outside the ``CroniterError`` hierarchy, code catching
+  ``CroniterError`` never saw it. Both fields now re-base like the five that already
+  worked: seconds take their phase from the start time's second, and years — which do
+  not start at zero — take theirs from the field minimum, as day-of-month and month
+  already do. [#254, @potiuk]
+- Reject out-of-range nth day-of-week values (``1#0``, ``1#7``) with an ordinary check
+  instead of an ``assert``. Under ``python -O`` the assert was stripped, so ``1#0``
+  passed ``is_valid`` and fired on every Monday and ``1#7`` passed and never fired.
+  [#278, @Raghuvardhan-Reddy78]
+- Fix ``{start}/{step}`` expanding to the whole field when ``start`` is the field
+  maximum. ``59/15 * * * *`` fired at ``:00``/``:15``/``:30``/``:45`` instead of
+  ``:59``, and the same held in every field at its own maximum: ``23/6`` hours,
+  ``31/5`` day-of-month, ``DEC/3`` months, ``SAT/2`` day-of-week, and — not in the
+  original report — ``59/15`` seconds and ``2099/5`` years. ``{start}/{step}``
+  normalizes to ``{start}-{max}/{step}``; when ``start`` is the maximum the two
+  bounds collide, making the token indistinguishable from an explicitly written
+  equal range such as ``Jan-Jan``, which croniter deliberately expands to the whole
+  cycle. The two forms are now distinguished. An explicitly written equal range still
+  means the whole cycle, and every start below the field maximum is unchanged. The fix
+  applies in ``expand_from_start_time`` mode as well as by default. (Under that flag
+  the whole cycle an equal range names now takes its phase from ``start_time``, as
+  every other cycle does — see #255 below.) [#246, @earfman]
+
+  .. warning::
+
+     **This changes existing schedules, silently and substantially.** Any
+     ``{max}/{step}`` expression that was firing across the whole field now fires
+     once per cycle. The ``{max}/1`` forms are the sharpest case, because they read
+     as "every": ``* * * * 6/1`` meant *every day* and now means *Saturdays only*;
+     ``59/1 * * * *`` meant *every minute* and now means *minute 59*. The same
+     applies to ``23/1`` hours, ``31/1`` day-of-month, ``12/1`` months, and to the
+     optional seconds and years fields (``59/1``, ``2099/1``). Use a wildcard
+     (``*`` or ``*/1``) for "every". **Before upgrading, audit for any field whose
+     value begins with that field's maximum followed by a slash.**
+
+     One consequence is worth stating separately: a ``{max}/{step}`` expression can
+     now be **unsatisfiable** rather than merely different, because it no longer
+     covers the whole field. ``0 0 1 1 * * 2099/1`` previously expanded the year
+     field to every year and now means 2099 alone, so iterating from a later start
+     time raises ``CroniterBadDateError`` instead of returning a date. The same
+     happens without a year field wherever the remaining value cannot occur:
+     ``0 0 31/5 2 *`` is now day 31 of February.
+
+- Fix ``expand_from_start_time`` discarding the lower bound of every range. Re-basing
+  overwrote ``low`` outright instead of supplying the phase of the cycle, so any range
+  whose start was above the field minimum fired below its own start: ``* 8-17 * * *``
+  expanded to hours ``0-17``, ``* * * * MON-FRI`` included Sunday, and ``10-50/15``
+  expanded to minutes ``7,22,37`` from a start at minute ``7``. Over a sweep of 101,088
+  ``expand_from_start_time`` expansions — all seven fields, every legal lower bound,
+  eight token shapes, seven steps, four start times — 73,898 contained at least one
+  value outside the range the expression declares; now none do. Re-basing still
+  supplies the phase — ``*/15`` is unchanged, and so is ``5/15`` whenever the start
+  time's phase is at or above 5 (from minute 2 it now gives ``17,32,47``, not
+  ``2,17,32,47``) — but the phase is advanced to the first value inside the declared
+  range, and where no value of the phase fits, the expression is honoured as written,
+  so an expansion can never come out empty. Hashed and random divisors (``H/15``,
+  ``R/15``, ``H(10-50)/7``) take their phase from the start time inside their declared
+  range, exactly like ``*/15`` and ``10-50/7``: the hash offset is a phase, so it is not
+  read as a lower bound. [#255, @potiuk]
+
+  Two side effects of overwriting the bound are fixed with it: colliding ``low`` onto
+  ``high`` made an ordinary range read as an explicit equal range and expand to the
+  whole cycle (``* * 10-11/2 * *`` became every second day of the month), and re-basing
+  a wrapping range unwrapped it (``* * * * 6-0``, Saturday and Sunday, became every day
+  of the week).
+
+  An explicitly written equal range means the whole cycle, and that cycle now takes its
+  phase from ``start_time`` like any other, so the two spellings of one schedule agree:
+  ``1-1/3`` and ``*/3`` in the month field both expand to February, May, August and
+  November from a start in February. Under the old behaviour they agreed by accident —
+  the discarded bound happened to land on the phase — and pinning the bound without
+  this would have made ``1-1/3`` ignore the flag outright, contradicting what the
+  README documents for it.
+
+  Also fixed, on the same line: a ``start_time`` of exactly the Unix epoch skipped
+  re-basing altogether, because the start time reaches the expansion as a timestamp
+  and ``0.0`` is falsy. ``0 0 * * 2-6/3`` from ``1970-01-01`` expanded to days ``2,5``
+  where the same expression one second later expanded to day ``4``.
+
+  .. warning::
+
+     **This changes most ``expand_from_start_time`` schedules.** 93,456 of the 101,088
+     expansions in the sweep differ. Any explicitly written range, equal range, wrapping
+     range or stepped start is affected; the untouched shapes are the plain wildcard,
+     the bare value, and ``*/step`` except where the step is wide enough to collide the
+     field's own bounds (``*/60`` in the minute field re-based to minute ``0`` rather
+     than to its phase). Default-mode expansions do not move at all, no expansion became
+     empty, and no error status changed.
+
+     **A schedule can fire less often than it did.** ``45/15`` goes from four fires an
+     hour to one, which is what that expression already means without the flag. More
+     generally, re-phasing a step inside a fixed window can cost one period even when
+     nothing was wrong with the schedule: ``10-20/7`` is ``10,17`` by default but ``14``
+     alone from a start at minute 7. Measured against the default expansion of the same
+     expression, no re-based expansion in the sweep fires *more* often, 13,539 fire
+     less, and the drop is never more than one period and never to zero.
+
+     **A schedule can also fire more often than it did**, in 17,038 of the swept
+     expansions. Every one of them is an explicit equal range or a wrapping range —
+     the two shapes the old behaviour re-read as something else. ``1-1/15`` in the
+     minute field expanded to ``[0]`` from a start at minute 0 and is now ``[0, 15, 30,
+     45]``, the whole cycle the equal range asks for; the wrapping range ``2-1``, which
+     covers the whole minute field, expanded to minutes ``0,1`` and is now every minute.
+     These are meanings being restored, not values being invented: no expansion holds a
+     value the expression does not declare.
+
+Testing and Documentation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- Document what ``expand_from_start_time`` actually means — that it moves the phase of a
+  cycle and not the values a field may take, that every field re-bases including the
+  optional seconds and years, and that the phase is read in the start time's own
+  timezone. Also document that a range with two equal bounds (``Jan-Jan``, ``Sun-Sun``)
+  means the whole cycle rather than the value it names, which was undocumented and is
+  the rule behind several of the bugs fixed in this release. [#257, @potiuk]
+- Document the bounds half of ``expand_from_start_time``: that a field declaring its own
+  range keeps both bounds and only the phase moves, that moving a phase inside a fixed
+  window can cost one period, that an expression whose phase does not fit is honoured as
+  written, and that a wrapping range is left alone. [#255, @potiuk]
+
+Packaging
+~~~~~~~~~
+- Bump pinned GitHub Actions via dependabot. [6e69553, #247; 3c6ce9b, #251; d2e8a13, #260;
+  d9f40f0, #269; 4be99c3, #274; 9fe300d, #285; 2725ef5, #290]
+- Bump pinned build dependencies (``hatchling``, ``packaging``) via dependabot.
+  [70564f2, #245; 3dd4d14, #262; e3ba628, #265; 309703f, #283; b4c7661, #291]
+- Remove the unused workflow that built the 32-bit Docker test images. [1b0c241, #292, @potiuk]
+
+
+6.2.4 (2026-07-10)
+------------------
+
+Bugfixes
+~~~~~~~~
+- Fix ``expand_from_start_time`` day-of-week low bound so Sunday wraps correctly for stepped day-of-week ranges (``isoweekday() % 7`` instead of ``weekday() + 1``). [44e3090, #239, @alhudz]
+
+Packaging
+~~~~~~~~~
+- Bump pinned GitHub Actions via dependabot. [fd13d2e, #240; 5cd2e46, #238]
+
+
+6.2.3 (2026-07-02)
+------------------
+
+Features and Improvements
+~~~~~~~~~~~~~~~~~~~~~~~~
+- Fix quadratic expansion of comma-separated range lists for a large speed-up on expressions with many ranges. [1d79fc6, #231, @alhudz]
+
+Bugfixes
+~~~~~~~~
+- Reject a zero step (e.g. ``5-5/0``) in equal and reversed cron ranges instead of silently accepting it. [ab27767, #232, @alhudz]
+- Fix ``expand_from_start_time`` month low-bound off-by-one so stepped month ranges start on the correct month. [f329964, #235, @alhudz]
+
+Packaging
+~~~~~~~~~
+- Fix zizmor-reported security findings in GitHub Actions workflows. [ed19f94, #230]
+- Bump pinned build and CI dependencies via dependabot.
+- Upgrade locked development and build dependencies (``uv lock --upgrade``).
+
+
+6.2.2 (2026-03-15)
+------------------
+
+Packaging
+~~~~~~~~~
+- Switch build backend from ``flit_core`` to ``hatchling`` with pinned dependencies. [4cce160]
+- Add PEP 639 license expression (``license = "MIT"``) to project metadata. [4cce160]
+- Pin all GitHub Actions to SHA hashes across CI workflows. [4cce160]
+- Add dependabot for automated dependency updates. [4cce160]
+- Add zizmor workflow for CI security scanning. [4cce160]
+
+
+6.2.1 (2026-03-15)
+------------------
+
+Bugfixes
+~~~~~~~~
+- Fix ``get_prev`` skipping Feb 29 on leap years for day-of-month expressions. [441a0b5, #203, @Souls-R]
+
+Packaging
+~~~~~~~~~
+- Add ``License :: OSI Approved :: MIT License`` classifier. [270cbbc, @cdheiser]
+
+
+6.2.0 (2026-03-14)
+------------------
+
+Features and Improvements
+~~~~~~~~~~~~~~~~~~~~~~~~
+- Add support for ``W`` (nearest weekday) in the day-of-month field. [c79d88a]
+- Add ``precision_in_seconds`` parameter to ``match()`` and ``match_range()`` to allow overriding the default matching precision. [7415d1e, #58]
+- Add ``strict`` parameter to ``is_valid()`` and ``expand()`` for cross-field validation of impossible day/month combinations. [0352d48, #199]
+
+Bugfixes
+~~~~~~~~
+- Fix memory leak by removing ``EXPRESSIONS`` global dict cache. [6ebfe56, @Souls-R]
+
+Testing and Documentation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- Document ``day_or`` and ``implement_cron_bug`` parameters for day-of-month/day-of-week interaction. [289bf73, #75]
+- Document ``precision_in_seconds`` parameter and default precision behavior for ``match()``. [7415d1e, #58]
+
+
+6.1.0 (2026-03-14)
+------------------
+
+Features and Improvements
+~~~~~~~~~~~~~~~~~~~~~~~~
+- Support for `zoneinfo` timezones. [b4e7295, Benjamin Drung (@bdrung)]
+- Add type hints to `croniter.__init__`, `timestamp_to_datetime`, and property initializations. [b171ea9, 257741e, c4f5e44, Benjamin Drung (@bdrung)]
+- Simplify code for `max_years_between_matches`. [e065efa, Benjamin Drung (@bdrung)]
+- Extend type check for `hash_id` to empty str/bytes. [6fe1d43, Benjamin Drung (@bdrung)]
+- Drop unused `_get_next_nearest` and `_get_prev_nearest`. [d7dab3a, Benjamin Drung (@bdrung)]
+- Reduce line length to 99 and unfold long Python code lines. [ecea402, f38d5f4, Benjamin Drung (@bdrung)]
+
+Bugfixes
+~~~~~~~~
+- Fix memory leak by removing `TIMESTAMP_TO_DT_CACHE` global dict cache. [1a9d3c0, Rafał Safin (@rafsaf)]
+- Fix memory leak by removing `EXPRESSIONS` global dict cache. [1883e15, @Souls-R]
+- Fix default value of `second_at_beginning` to a boolean. [dc63ed2, Benjamin Drung (@bdrung)]
+- Fix always missing the timestamp to datetime cache. [18eb299, Benjamin Drung (@bdrung)]
+- Fix skipping first of March. [de21a9d, Benjamin Drung (@bdrung)]
+- Fix DST handling by rewriting the DST logic. [f48387b, Benjamin Drung (@bdrung)]
+- Fix all flake8 complaints. [08c1f83, Benjamin Drung (@bdrung)]
+
+Testing and Documentation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- Test: fix date in DST test. [871e391, Benjamin Drung (@bdrung)]
+- Test: document time jumps in DST test cases. [2d72258, Benjamin Drung (@bdrung)]
+- Test: use isoformat() to compare dates with timezone information. [1dd3562, Benjamin Drung (@bdrung)]
+
+Other
+~~~~~
+- Announce back that croniter is maintained now as part of pallets-eco. [Jarek Potiuk (@jarekpotiuk)]
+
+
+6.0.0 (2024-12-17)
+------------------
+- Announce for now that croniter dev is ended (CRA).
+- Rework timestamp_to_datetime to use whatever timezone [kiorky]
+- Make datetime_to_timestamp & timestamp_to_datetime public [kiorky]
+- Fix EPOCH calculation in case of non UTC & 32 bits based systems [kiorky]
+- Apply isort formatter [kiorky]
+- Reintegrate test_speed [kiorky]
+- Apply black formatter [evanpurkhiser, kiorky]
+- Code quality changes [evanpurkhiser, kiorky]
+    - Remove unused _get_caller_globals_and_locals [evanpurkhiser]
+    - Remove single-use bad_length [evanpurkhiser]
+    - Remove unused `days` in `proc_month` [evanpurkhiser]
+    - Use `field_index` over `i` for readability [evanpurkhiser]
+    - Always use `"""` for docstrings [evanpurkhiser]
+    - Make helper instance methods that do not use self static [evanpurkhiser]
+    - Remove unusd call to sys.exc_info [evanpurkhiser]
+    - Remove unused `ALPHAS` [evanpurkhiser]
+    - Improve `croniter.expand` documentation [evanpurkhiser]
+
+5.0.1 (2024-10-29)
+------------------
+
+- Community wanted: Reintroduce 7 as DayOfWeek in deviation from standard cron (#90). [kiorky]
+
+4.0.0 (2024-10-28)
+------------------
+
+- Remove DayOfWeek alias 7 to DayOfWeek 0 to stick to standard cron (#90). [kiorky]
+- Fix DOW ranges calculations when lastday is a Sunday. [kiorky]
+
+3.0.4 (2024-10-25)
+------------------
+
+- Fix overflow on 32bits systems (#87) [kiorky]
+- Fix python2 testing (related to #93) [kiorky]
+- Modernize packaging. Special thanks to Aarni Koskela (akx) for all the inputs. [kiorky, akx]
+
+3.0.3 (2024-07-26)
+------------------
+
+- fix lint [kiorky]
+
+3.0.2 (2024-07-26)
+------------------
+
+- Fix start_time not respected in get_next/get_prev/all_next/all_prev (#86) [hesstobi, kiorky]
+
+3.0.1 (2024-07-25)
+------------------
+
+- Add an `update_current` argument to get_next/get_prev/all_next/all_prev to facilitate writing of some downstream code, see #83. [kiorky]
+
+3.0.0 (2024-07-23)
+------------------
+
+- Support for year field [zhouyizhen, kiorky]
+- Better support for 6 fields (second), and 7 fields crons [zhouyizhen, kiorky]
+- Better fix hashed expressions omitting some entries (#82, #42, #30) fix is retained over #42 initial fix [zhouyizhen, kiorky]
+- Ensure match return false when not time available (#81) [zhouyizhen, kiorky]
+
+
+2.0.7 (2024-07-16)
+------------------
+
+- fix doc
+
+
+2.0.6 (2024-07-16)
+------------------
+
+- Implement second_at_beginning [zhouyizhen, kiorky]
+- Support question mark as wildcard [zhouyizhen, kiorky]
+- Support to start a cron from a reference start time [mghextreme, kiorky]
+
+
+2.0.5 (2024-04-20)
+------------------
+
+- No changes, fix lint [kiorky]
+
+
+2.0.4 (2024-04-20)
+------------------
+
+- Support hashid strings in is_valid [george-kuanli-peng, kiorky]
+- Avoid over-optimization in crontab expansions [Cherie0125, liqirui <liqirui@baidu.com>, kiorky]
+
+
+2.0.3 (2024-03-19)
+------------------
+
+- Add match_range function [salitaba]
+
+
+2.0.2 (2024-02-29)
+------------------
+
+- fix leap year (29 days in February) [zed2015]
+
+
+2.0.1 (2023-10-11)
+------------------
+
+- Fix release issue [kiorky]
+
+
+2.0.0 (2023-10-10)
+------------------
+
+- Add Python 3.12 support [rafsaf]
+- Make major release instructions [kiorky]
+
+
+1.4.1 (2023-06-15)
+------------------
+
+- Make a retrocompatible version of 1.4.0 change about supporting VIXIECRON bug. (fix #47)
+  [kiorky]
+
+
+1.4.0 (2023-06-15)
+------------------
+
+- Added "implement_cron_bug" flag to make the cron parser compatible with a bug in Vixie/ISC Cron
+  [kiorky, David White <dwhite2@cisco.com>]
+  *WARNING*: EXPAND METHOD CHANGES RETURN VALUE
+
+
+1.3.15 (2023-05-25)
+-------------------
+
+- Fix hashed expressions omitting some entries
+  [@waltervos/Walter Vos <walter.vos@ns.nl>]
+- Enhance .match() precision for 6 position expressions
+  [@szpol/szymon <szymon.polinkiewicz@gmail.com>]
+
+1.3.14 (2023-04-12)
+-------------------
+
+- Lint
+
+
+1.3.13 (2023-04-12)
+-------------------
+
+- Add check for range begin/end
+
+
+
+1.3.12 (2023-04-12)
+-------------------
+
+- restore py2 compat
+
+
+1.3.11 (2023-04-12)
+-------------------
+
+-  Do not expose `i` into global namespace
+
+
+1.3.10 (2023-04-07)
+-------------------
+
+- Fix DOW hash parsing [kiorky]
+- better error handling on py3 [kiorky]
+
+1.3.8 (2022-11-22)
+------------------
+
+- Add Python 3.11 support and move docs files to main folder [rafsaf]
+
+
+1.3.7 (2022-09-06)
+------------------
+
+- fix tests
+- Fix croniter_range infinite loop  [Shachar Snapiri <ssnapiri@paloaltonetworks.com>]
+
+
+1.3.5 (2022-05-14)
+------------------
+
+- Add Python 3.10 support [eelkevdbos]
+
+
+1.3.4 (2022-02-18)
+------------------
+
+- Really fix compat for tests under py27
+  [kiorky]
+
+
+1.3.3 (2022-02-18)
+------------------
+
+- Fix compat for tests under py27
+  [kiorky]
+
+
+1.3.2 (2022-02-18)
+------------------
+
+- Fix #12: regressions with set_current
+  [kiorky, agateblue]
+
+
+1.3.1 (2022-02-15)
+------------------
+
+- Restore compat with python2
+  [kiorky]
+
+
+1.3.0 (2022-02-15)
+------------------
+
+- Add a way to make next() easier to use. This fixes #11
+  [kiorky]
+
+
+1.2.0 (2022-01-14)
+------------------
+
+- Enforce validation for day=1. Before this release we used to support day=0 and it was silently glided to day=1 to support having both day in day in 4th field when it came to have 6fields cron forms (second repeat). It will now raises a CroniterBadDateError. See https://github.com/kiorky/croniter/issues/6
+  [kiorky]
+
+1.1.0 (2021-12-03)
+------------------
+
+- Enforce validation for month=1. Before this release we used to support month=0 and it was silently glided to month=1 to support having both day in month in 4th field when it came to have 6fields cron forms (second repeat). It will now raises a CroniterBadDateError. See https://github.com/kiorky/croniter/issues/6
+  [kiorky]
+
+1.0.15 (2021-06-25)
+-------------------
+
+- restore py2 [kiorky]
+
+
+1.0.14 (2021-06-25)
+-------------------
+
+- better type checks [kiorky]
+
+
+1.0.13 (2021-05-06)
+-------------------
+
+- Fix ZeroDivisionError with ``* * R/0 * *``
+  [cuu508]
+
+1.0.12 (2021-04-13)
+-------------------
+
+- Add support for hashed/random/keyword expressions
+  Ryan Finnie (rfinnie)
+- Review support support for hashed/random/keyword expression and add expanders reactor
+  [ kiorky ]
+
+
+1.0.11 (2021-04-07)
+-------------------
+
+- fix bug: bad case:``0 6 30 3 *``
+  [zed2015(zhangchi)]
+- Add support for ``L`` in the day_of_week component.  This enable expressions like ``* * * * L4``, which means last Thursday of the month.  This resolves #159.
+  [Kintyre]
+- Create ``CroniterUnsupportedSyntaxError`` exception for situations where CRON syntax may be valid but some combinations of features is not supported.
+  Currently, this is used when the ``day_of_week`` component has a combination of literal values and nth/last syntax at the same time.
+  For example, ``0 0 * * 1,L6`` or ``0 0 * * 15,sat#1`` will both raise this exception because of mixing literal days of the week with nth-weekday or last-weekday syntax.
+  This *may* impact existing cron expressions in prior releases, because ``0 0 * * 15,sat#1`` was previously allowed but incorrectly handled.
+  [Kintyre]
+
+- Update ``croniter_range()`` to allow an alternate ``croniter`` class to be used.  Helpful when using a custom class derived from croniter.
+  [Kintyre]
+
+
+1.0.10 (2021-03-25)
+-------------------
+
+- Remove external library ``natsort``.
+  Sorting of cron expression components now handled with ``sorted()`` with a custom ``key`` function.
+  [Kintyre]
+
+
+
+1.0.9 (2021-03-23)
+------------------
+
+- Remove futures dependency
+  [kiorky]
+
+
+1.0.8 (2021-03-06)
+------------------
+
+- Update `_expand` to lowercase each component of the expression.
+  This is in relation to #157. With this change, croniter accepts and correctly handles `* * 10-L * *`.
+  [cuu508]
+
+
+1.0.7 (2021-03-02)
+------------------
+
+- Fix _expand to reject int literals with underscores
+  [cuu508]
+- Remove a debug statement to make flake8 happy
+  [cuu508]
+
+1.0.6 (2021-02-01)
+------------------
+
+- Fix combination of star and invalid expression bugs
+  [kiorky]
+
+
+1.0.5 (2021-01-29)
+------------------
+
+- Security fix: fix overflow when using cron ranges
+  [kiorky]
+
+1.0.4 (2021-01-29)
+------------------
+
+- Spelling fix release
+
+
+1.0.3 (2021-01-29)
+------------------
+
+- Fix #155: raise CroniterBadCronError when error syntax
+  [kiorky]
+
+
+1.0.2 (2021-01-19)
+------------------
+
+- Fix match when datetime has microseconds
+  [kiorky]
+
+1.0.1 (2021-01-06)
+------------------
+- no changes, just to make sense with new semver2 (making croniter on a stable state)
+  [kiorky]
+
+
+0.3.37 (2020-12-31)
+-------------------
+
+- Added Python 3.8 and 3.9 support
+  [eumiro]
+
+
+0.3.36 (2020-11-02)
+-------------------
+
+- Updated docs section regarding ``max_years_between_matches`` to be more shorter and hopefully more relevant.
+  [Kintyre]
+- Don't install tests
+  [scop]
+
+
+0.3.35 (2020-10-11)
+-------------------
+
+- Handle L in ranges. This fixes #142.
+  [kiorky]
+- Add a new initialization parameter ``max_years_between_matches`` to support finding the next/previous date beyond the default 1 year window, if so desired.  Updated README to include additional notes and example of this usage.  Fixes #145.
+  [Kintyre]
+- The ``croniter_range()`` function was updated to automatically determines the appropriate ``max_years_between_matches`` value, this preventing handling of the ``CroniterBadDateError`` exception.
+  [Kintyre]
+- Updated exception handling classes:  ``CroniterBadDateError`` now only
+  applies during date finding operations (next/prev), and all parsing errors can now be caught using ``CroniterBadCronError``.  The ``CroniterNotAlphaError`` exception is now a subclass of ``CroniterBadCronError``.  A brief description of each exception class was added as an inline docstring.
+  [Kintyre]
+- Updated iterable interfaces to replace the ``CroniterBadDateError`` with ``StopIteration`` if (and only if) the ``max_years_between_matches`` argument is provided.  The rationale here is that if the user has specified the max tolerance between matches, then there's no need to further inform them of no additional matches.  Just stop the iteration.  This also keeps backwards compatibility.
+  [Kintyre]
+- Minor docs update
+  [Kintyre]
+
+
+0.3.34 (2020-06-19)
+-------------------
+
+- Feat ``croniter_range(start, stop, cron)``
+  [Kintyre]
+- Optimization for poorly written cron expression
+  [Kintyre]
+
+0.3.33 (2020-06-15)
+-------------------
+
+- Make dateutil tz support more official
+  [Kintyre]
+- Feat/support for day or
+  [田口信元]
+
+0.3.32 (2020-05-27)
+-------------------
+
+- document seconds repeats, fixes #122
+  [kiorky]
+- Implement match method, fixes #54
+  [kiorky]
+- Adding tests for #127 (test more DSTs and croniter behavior around)
+  [kiorky]
+- Changed lag_hours comparison to absolute to manage dst boundary when getting previous
+  [Sokkka]
+
+0.3.31 (2020-01-02)
+-------------------
+
+- Fix get_next() when start_time less then 1s before next instant
+  [AlexHill]
+
+
+0.3.30 (2019-04-20)
+-------------------
+
+- credits
+
+
+0.3.29 (2019-03-26)
+-------------------
+
+- credits
+- history stripping (security)
+- Handle -Sun notation, This fixes `#119 <https://github.com/taichino/croniter/issues/119>`_.
+  [kiorky]
+- Handle invalid ranges correctly,  This fixes `#114 <https://github.com/taichino/croniter/issues/114>`_.
+  [kiorky]
+
+0.3.25 (2018-08-07)
+-------------------
+- Pypi hygiene
+  [hugovk]
+
+
+0.3.24 (2018-06-20)
+-------------------
+- fix `#107 <https://github.com/taichino/croniter/issues/107>`_: microsecond threshold
+  [kiorky]
+
+
+0.3.23 (2018-05-23)
+-------------------
+
+- fix ``get_next`` while preserving the fix of ``get_prev`` in 7661c2aaa
+  [Avikam Agur <avikam@pagaya-inv.com>]
+
+
+0.3.22 (2018-05-16)
+-------------------
+- Don't count previous minute if now is dynamic
+  If the code is triggered from 5-asterisk based cron
+  ``get_prev`` based on ``datetime.now()`` is expected to return
+  current cron iteration and not previous execution.
+  [Igor Khrol <igor.khrol@toptal.com>]
+
+0.3.20 (2017-11-06)
+-------------------
+
+- More DST fixes
+  [Kevin Rose <kbrose@github>]
+
+
+0.3.19 (2017-08-31)
+-------------------
+
+- fix #87: backward dst changes
+  [kiorky]
+
+
+0.3.18 (2017-08-31)
+-------------------
+
+- Add is valid method, refactor errors
+  [otherpirate, Mauro Murari <mauro_murari@hotmail.com>]
+
+
+0.3.17 (2017-05-22)
+-------------------
+- DOW occurrence sharp style support.
+  [kiorky, Kengo Seki <sekikn@apache.org>]
+
+
+0.3.16 (2017-03-15)
+-------------------
+
+- Better test suite [mrcrilly@github]
+- DST support [kiorky]
+
+0.3.15 (2017-02-16)
+-------------------
+
+- fix bug around multiple conditions and range_val in
+  _get_prev_nearest_diff.
+  [abeja-yuki@github]
+
+0.3.14 (2017-01-25)
+-------------------
+
+- issue #69: added day_or option to change behavior when day-of-month and
+  day-of-week is given
+  [Andreas Vogl <a.vogl@hackner-security.com>]
+
+
+
+0.3.13 (2016-11-01)
+-------------------
+
+- `Real fix for #34 <https://github.com/taichino/croniter/pull/73>`_
+  [kiorky@github]
+- `Modernize test infra <https://github.com/taichino/croniter/pull/72>`_
+  [kiorky@github]
+- `Release as a universal wheel <https://github.com/kiorky/croniter/pull/16>`_
+  [adamchainz@github]
+- `Raise ValueError on negative numbers <https://github.com/taichino/croniter/pull/63>`_
+  [josegonzalez@github]
+- `Compare types using "issubclass" instead of exact match <https://github.com/taichino/croniter/pull/70>`_
+  [darkk@github]
+- `Implement step cron with a variable base <https://github.com/taichino/croniter/pull/60>`_
+  [josegonzalez@github]
+
+0.3.12 (2016-03-10)
+-------------------
+- support setting ret_type in __init__ [Brent Tubbs <brent.tubbs@gmail.com>]
+
+0.3.11 (2016-01-13)
+-------------------
+
+- Bug fix: The get_prev API crashed when last day of month token was used. Some
+  essential logic was missing.
+  [Iddo Aviram <iddo.aviram@similarweb.com>]
+
+
+0.3.10 (2015-11-29)
+-------------------
+
+- The functionality of 'l' as day of month was broken, since the month variable
+  was not properly updated
+  [Iddo Aviram <iddo.aviram@similarweb.com>]
+
+0.3.9 (2015-11-19)
+------------------
+
+- Don't use datetime functions python 2.6 doesn't support
+  [petervtzand]
+
+0.3.8 (2015-06-23)
+------------------
+- Truncate microseconds by setting to 0
+  [Corey Wright]
+
+
+0.3.7 (2015-06-01)
+------------------
+
+- converting sun in range sun-thu transforms to int 0 which is
+  recognized as empty string; the solution was to convert sun to string "0"
+
+0.3.6 (2015-05-29)
+------------------
+
+- Fix default behavior when no start_time given
+  Default value for ``start_time`` parameter is calculated at module init time rather than call time.
+- Fix timezone support and stop depending on the system time zone
+
+
+
+0.3.5 (2014-08-01)
+------------------
+
+- support for 'l' (last day of month)
+
+
+0.3.4 (2014-01-30)
+------------------
+
+- Python 3 compat
+- QA Release
+
+
+0.3.3 (2012-09-29)
+------------------
+- proper packaging
+
